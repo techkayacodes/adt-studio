@@ -320,6 +320,7 @@ export {
   elementAudioTextId,
   parseElementAudioTextId,
   isElementAudioTextId,
+  isElementAudioNodeId,
 } from "./element-audio.js"
 
 export {
