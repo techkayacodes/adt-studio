@@ -14,7 +14,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { cn } from "@/lib/utils"
 import { useLingui } from "@lingui/react"
-import { msg } from "@lingui/core/macro"
+import { msg, select } from "@lingui/core/macro"
 import type { MessageDescriptor } from "@lingui/core"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/components/ui/sonner"
@@ -47,6 +47,10 @@ import type { TaskInfoResponse } from "@/api/client"
 import { getStageLabelI18n, getStepLabelI18n, getStageStatusLabelI18n } from "../pipeline-i18n"
 import { ALL_STEP_NAMES, STAGE_ORDER } from "@adt/types"
 import { useHasUnsavedChanges } from "./floating-save"
+import { useBookRejectedTextProvider } from "@/hooks/use-api-key"
+import { providerSelectKey } from "@/i18n/provider-select-key"
+import { providerAnchor } from "@/components/app/screens/settings/provider-anchor"
+import { cardKeyForProvider } from "@/components/app/screens/settings/providers/cards"
 
 const STAGE_GROUP_LABELS: Record<StageGroup, MessageDescriptor> = {
   convert: msg`Core Pipeline`,
@@ -86,7 +90,7 @@ export function StageSidebar({
   const { i18n } = useLingui()
   const matchRoute = useMatchRoute()
   const search = useSearch({ strict: false }) as { tab?: string }
-  const { stageState, cancelRun, isCancelling, sourceUpdateStages = [] } = useBookRun()
+  const { stageState, cancelRun, isCancelling, sourceUpdateStages = [], storyboardCoverage } = useBookRun()
   const { data: accessibilityAssessment } = useAccessibilityAssessment(bookLabel)
   const { data: signLanguageData } = useSignLanguageVideos(bookLabel)
   const { data: packageStatus } = usePackageAdtStatus(bookLabel)
@@ -104,6 +108,16 @@ export function StageSidebar({
   const { data: catalog } = useOutputSummary(bookLabel)
   const activeDirtyTabs = useDirtyTabsForStage(activeStep)
   const { data: sidebarPages } = usePages(bookLabel, { enabled: false })
+  // Only the overview and the landing pages carry the key banner, so a key the
+  // provider refuses is also flagged on the book's settings cog, which every
+  // page of the book shows, and links to that provider's card.
+  const rejectedProvider = useBookRejectedTextProvider(bookLabel)
+  const rejectedName = rejectedProvider?.displayName ?? ""
+  // Lets translations pick the article for the name (pt-BR: "da OpenAI", "do Google").
+  const rejectedProviderKey = providerSelectKey(rejectedProvider?.providerId ?? "")
+  const bookSettingsLabel = rejectedProvider
+    ? i18n._(msg({ comment: "providerKey: openai, anthropic, google, gemini, azure, elevenlabs, custom, ollama, codex, claude_agent. Use it to pick a gendered article.", message: `${select(rejectedProviderKey, { other: `API Key Settings — the ${rejectedName} key was rejected` })}` }))
+    : i18n._(msg`API Key Settings`)
   const hasNoTextLayer = (sidebarPages ?? []).some((p) => p.extractionWarning)
   const noTextLayerLabel = i18n._(
     msg`Some pages have no embedded text layer — text was recovered from the page image. Prefer a text-based PDF.`
@@ -147,10 +161,11 @@ export function StageSidebar({
     flex1:     "flex-1",
   }
 
-  const validationCompleted = Boolean(accessibilityAssessment?.assessment)
+  const outputComplete = packageStatus?.complete !== false
+  const validationCompleted = outputComplete && Boolean(accessibilityAssessment?.assessment)
   const signLanguageCompleted = signLanguageData?.videos?.some((v) => v.sectionId !== null) ?? false
-  const previewCompleted = packageStatus?.hasAdt ?? false
-  const exportCompleted = tasks.some((t) => t.kind === "prepare-export" && t.status === "completed")
+  const previewCompleted = outputComplete && (packageStatus?.hasAdt ?? false)
+  const exportCompleted = outputComplete && tasks.some((t) => t.kind === "prepare-export" && t.status === "completed")
 
   const completionOverrides: Record<string, boolean> = {
     "sign-language": signLanguageCompleted,
@@ -238,7 +253,10 @@ export function StageSidebar({
 
     // Expose stage status to screen readers — the visual ring/color carries it
     // for sighted users, but the link's accessible name must say it too.
-    const statusKey = step.slug === "book" ? undefined : activeAttempt || state === "error" ? state : stageNeedsRerun ? "needs-update" : content?.current ? "done" : state
+    const retainedStoryboardStatus = step.slug === "storyboard" && state === "idle" && hasRenderings
+      ? storyboardCoverage?.complete === false ? "needs-update" : "output-available"
+      : undefined
+    const statusKey = step.slug === "book" ? undefined : activeAttempt || state === "error" ? state : stageNeedsRerun ? "needs-update" : content?.current ? "done" : retainedStoryboardStatus ?? state
     const stepAriaLabel = stageNotNeeded
       ? i18n._(msg`${stepLabel}: not needed for imported ADTs`)
       : statusKey
@@ -295,6 +313,18 @@ export function StageSidebar({
                   role="img"
                   aria-label={stepAriaLabel}
                   title={stepAriaLabel}
+                  className="absolute -top-1 -right-1 z-20 flex items-center justify-center w-3.5 h-3.5 rounded-full bg-red-600 ring-2 ring-background"
+                >
+                  <AlertCircle className="w-2.5 h-2.5 text-white" aria-hidden="true" />
+                </span>
+              ) : step.slug === "book" && rejectedProvider && railCollapsed ? (
+                // The settings cog is clipped while the rail is collapsed;
+                // mirror its rejected-key dot on the book icon until hover
+                // expands the rail.
+                <span
+                  role="img"
+                  aria-label={bookSettingsLabel}
+                  title={bookSettingsLabel}
                   className="absolute -top-1 -right-1 z-20 flex items-center justify-center w-3.5 h-3.5 rounded-full bg-red-600 ring-2 ring-background"
                 >
                   <AlertCircle className="w-2.5 h-2.5 text-white" aria-hidden="true" />
@@ -388,15 +418,28 @@ export function StageSidebar({
               to="/books/$label/$step/settings"
               params={{ label: bookLabel, step: step.slug }}
               search={{ tab: "general" }}
-              title={i18n._(msg`API Key Settings`)}
+              {...(rejectedProvider
+                ? { hash: providerAnchor(cardKeyForProvider(rejectedProvider.providerId)), "aria-label": bookSettingsLabel }
+                : {})}
+              title={bookSettingsLabel}
               className={cn(
-                "shrink-0 inline-flex items-center justify-center w-6 h-6 rounded-full transition-colors",
+                "relative shrink-0 inline-flex items-center justify-center w-6 h-6 rounded-full transition-colors",
                 isActive
                   ? "text-white/60 hover:text-white hover:bg-white/20"
-                  : "opacity-0 group-hover/row:opacity-100 text-muted-foreground/50 group-hover/row:bg-muted hover:text-foreground hover:bg-muted-foreground/20"
+                  : rejectedProvider
+                    ? "text-muted-foreground hover:text-foreground hover:bg-muted-foreground/20"
+                    : "opacity-0 group-hover/row:opacity-100 text-muted-foreground/50 group-hover/row:bg-muted hover:text-foreground hover:bg-muted-foreground/20"
               )}
             >
               <Settings className="w-3.5 h-3.5" />
+              {/* A dot, as on the app's Settings link: one thing waiting, on the card the link opens. */}
+              {rejectedProvider && (
+                <span
+                  data-rejected-key-dot
+                  aria-hidden
+                  className="absolute right-0.5 top-0.5 size-2 rounded-full bg-red-500 ring-2 ring-background motion-safe:animate-in motion-safe:zoom-in-50 motion-safe:duration-300"
+                />
+              )}
             </Link>
           ) : settingsTabs ? (
             <Link
@@ -515,7 +558,6 @@ export function StageSidebar({
                 onSelectPage={onSelectPage}
                 sectionIndex={sectionIndex}
                 onSelectSection={onSelectSection}
-                stageRunning={currentState === "running"}
               />
             )}
           </div>
@@ -781,7 +823,6 @@ function PageIndex({
   onSelectPage,
   sectionIndex,
   onSelectSection,
-  stageRunning,
 }: {
   bookLabel: string
   activeStep: string
@@ -789,7 +830,6 @@ function PageIndex({
   onSelectPage?: (pageId: string) => void
   sectionIndex?: number
   onSelectSection?: (index: number) => void
-  stageRunning?: boolean
 }) {
   const { data: pages } = usePages(bookLabel)
   const activeStepDef = STAGES.find((s) => s.slug === activeStep)
@@ -854,7 +894,6 @@ function PageIndex({
                 onSelect={() => onSelectPage?.(page.pageId)}
                 sectionIndex={isActive ? sectionIndex : undefined}
                 onSelectSection={isActive ? onSelectSection : undefined}
-                stageRunning={stageRunning}
               />
             </div>
           )
@@ -874,17 +913,14 @@ function PageRow({
   onSelect,
   sectionIndex,
   onSelectSection,
-  stageRunning,
 }: {
   bookLabel: string
-  page: { pageId: string; textPreview: string; pageNumber: number; sectionCount: number; hasRendering?: boolean; prunedSections?: number[] }
+  page: { pageId: string; textPreview: string; pageNumber: number; sectionCount: number; prunedSections?: number[] }
   isActive: boolean
   activeStepDef?: (typeof STAGES)[number]
   onSelect: () => void
   sectionIndex?: number
   onSelectSection?: (index: number) => void
-  /** Whether the parent stage is currently running */
-  stageRunning?: boolean
 }) {
   const { i18n } = useLingui()
   const { data, isLoading } = usePageImage(bookLabel, page.pageId)
@@ -929,9 +965,6 @@ function PageRow({
 
   const imgSrc = data?.imageBase64 ? `data:image/png;base64,${data.imageBase64}` : null
 
-  // Page is still being processed during a storyboard run
-  const pageProcessing = stageRunning && !page.hasRendering
-
   const showSections = isActive && page.sectionCount > 1 && onSelectSection
 
   return (
@@ -958,11 +991,6 @@ function PageRow({
               onMouseLeave={handleLeave}
               className="w-full h-full rounded object-cover object-center ring-1 ring-border"
             />
-          )}
-          {pageProcessing && (
-            <div className="absolute inset-0 flex items-center justify-center rounded bg-black/30">
-              <Loader2 className="w-4 h-4 animate-spin text-white" />
-            </div>
           )}
         </div>
         <div className="flex flex-col gap-0.5 min-w-0 flex-1 pt-0.5">

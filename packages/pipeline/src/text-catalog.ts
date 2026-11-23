@@ -1,3 +1,5 @@
+import { partScopedPages, requiredPartRange } from "./sectioning-window.js"
+import { resolveQuizOptionId } from "@adt/types"
 import { extractImageIds } from "./image-captioning.js"
 import { parseDocument, DomUtils } from "htmlparser2"
 import type {
@@ -17,7 +19,6 @@ import {
   answerTextId,
   elementAudioTextId,
   resolveQuizId,
-  resolveQuizOptionId,
   withResolvedQuizIds,
 } from "@adt/types"
 import type { Storage, PageData } from "@adt/storage"
@@ -298,7 +299,7 @@ function buildGlossaryEntries(storage: Storage): TextCatalogEntry[] {
 /**
  * Build quiz entries from the quiz-generation node.
  */
-function buildQuizEntries(storage: Storage): TextCatalogEntry[] {
+function buildQuizEntries(storage: Storage, pageIds?: ReadonlySet<string>): TextCatalogEntry[] {
   const row = storage.getLatestNodeData("quiz-generation", "book")
   if (!row) return []
 
@@ -309,6 +310,7 @@ function buildQuizEntries(storage: Storage): TextCatalogEntry[] {
   const entries: TextCatalogEntry[] = []
   for (let i = 0; i < data.quizzes.length; i++) {
     const quiz = data.quizzes[i]
+    if (pageIds && !pageIds.has(quiz.afterPageId)) continue
     const qid = resolveQuizId(quiz, i)
     entries.push({ id: `${qid}_que`, text: quiz.question, locations: [{ group: "quizzes", role: "question" }] })
 
@@ -434,6 +436,8 @@ function loadElementAudioEntries(
 
 /** Synchronous snapshot for atomic authored-save/catalog reconciliation. */
 export function buildTextCatalogSnapshot(storage: Storage, pages: PageData[]): TextCatalogOutput {
+  const partPageIds = storage.bookDir && requiredPartRange(storage.bookDir) ? new Set(partScopedPages(storage).map(page => page.pageId)) : undefined
+  if (partPageIds) pages = pages.filter(page => partPageIds.has(page.pageId))
   const entries: TextCatalogEntry[] = []
   const hasElementAudio = (storage.getNodeItemIds?.(ELEMENT_AUDIO_NODE)?.length ?? 0) > 0
   const locations = hasElementAudio
@@ -470,22 +474,22 @@ export function buildTextCatalogSnapshot(storage: Storage, pages: PageData[]): T
     // match the rendered HTML (1 section/page), not the semantic tree.
     const sectioning = getRenderSectioning(storage, page.pageId)
 
-    const rendering = withLegacyRenderingOwnership(storage, page.pageId, parsed.data)
-    const captionMap = loadCaptionMap(storage, page.pageId, extractImageIds(rendering.sections.map((section) => section.html)))
+    const captionMap = loadCaptionMap(storage, page.pageId, extractImageIds(parsed.data.sections.map((section) => section.html)))
     entries.push(...extractPageEntries(
       page.pageId,
-      rendering,
+      withLegacyRenderingOwnership(storage, page.pageId, parsed.data),
       captionMap,
       sectioning
     ))
     entries.push(...elementAudio)
+
   }
 
   // Glossary
   entries.push(...buildGlossaryEntries(storage))
 
   // Quizzes
-  entries.push(...buildQuizEntries(storage))
+  entries.push(...buildQuizEntries(storage, partPageIds))
 
   const byId = new Map<string, TextCatalogEntry>()
   for (const entry of entries) {

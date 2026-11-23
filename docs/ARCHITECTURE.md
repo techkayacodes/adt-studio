@@ -171,6 +171,20 @@ Never hardcode stage/step ordering, names, or groupings anywhere else. Add new d
 
 ---
 
+### Sectioning admission and publication
+
+Sectioning's book-level policies live in focused `packages/pipeline/src/` modules:
+
+- `sectioning-window.ts` resolves whole-book and mandatory part page windows.
+- `sectioning-replacement-signature.ts` binds replacement consent to current configuration, source selections and prompts.
+- `sectioning-admission.ts` orchestrates effective inputs, source prerequisites and execution admission. HTTP admission, queued execution, the direct runner and the worker each call it independently; a returned snapshot does not authorize later work.
+- `authored-output.ts` validates replacement consent/versions, selects missing or explicitly named pages, checks identity history and performs the scoped Storyboard reset. It derives affected stages from `getStageClearOrder("sectioning")`.
+- `generation-config.ts` projects settings relevant to Sectioning or Storyboard. Unrelated downstream or scheduling preferences do not invalidate generation; page/window/prompt/identity guards remain separate.
+- `sectioning-lifecycle.ts` retains extraction admission and informational lifecycle bookkeeping, with compatibility exports for existing callers.
+- `storyboard-publication.ts` prepares guarded publication. Ordinary same-layout runs publish successful page pairs incrementally; actual layout switches retain the previous layout until the active window can publish atomically.
+
+The shared admission helper does not replace the book writer, reset-transaction checks or publication-time input/version checks. Those boundaries remain responsible for revalidation immediately before their mutations. `sectioning-errors.ts` owns the shared error class so callers and middleware preserve error identity without a lifecycle/publication import cycle.
+
 ## Data Flow
 
 ```
@@ -236,6 +250,12 @@ Books in a right-to-left language (Urdu, Arabic, Hebrew, Persian, Pashto, …) a
 
 **Direction-neutral pages (SPEC-0024).** A book has one page layout for all of its languages: a translation is swapped into the same HTML. So for a book where any language, source or translation, is right-to-left, `renderPageHtml()` rewrites the page as it is packaged or previewed (`neutralizeDirectionMarkup()`, `packages/pipeline/src/direction-neutral-html.ts`): `text-left`/`text-right` become `text-start`/`text-end`, mapped for the direction the page was written in; a floated box gets the same treatment (`float-left`/`float-right` and `clear-*` become `float-start`/`float-end`, and the `ml-*`/`mr-*` gap on the floated element becomes `ms-*`/`me-*`); and a `dir` that only repeats the element's inherited direction is removed. A `dir` that changes the direction is kept, and the classes on and inside that element are mapped for its direction rather than the page's, because `start` and `end` are resolved against the element they are on. The page looks the same in its own language and mirrors correctly in the other. Stored pages are not changed, and `resolvePageDirection()` returns `undefined` for a book with no right-to-left language, which leaves its output byte-identical. The Studio preview stylesheet (`generateTailwindCss()` in `apps/api/src/routes/adt-preview.ts`) is built from the stored HTML *and* its rewritten form, because the rewrite introduces classes the stored HTML does not contain.
 
+A book whose pages are written right to left gets two more things at generation time. The render, review and edit prompts include `prompts/_text_direction.liquid`, which tells the model the page is right-to-left; it renders nothing unless the page direction is `rtl`, so other books' prompts and cache keys do not change. And `validateWebRendering()` applies the same rewrite to HTML that has passed validation, so new right-to-left pages are stored direction-neutral; `renderSectionLlm()` applies it once more after its last repairs, because the table-of-contents repair runs there and writes `text-right` on each page number. There it also corrects three things rather than preserving them: right-to-left text the model pushed to the left is aligned to the start, a table-of-contents page number is aligned to the end of its cell, and a floated box whose only side margin is on its outer side gets that gap on the text side. It repairs instead of rejecting, so it cannot cost a retry or fail a page.
+
+A left-to-right page is stored as the model wrote it, even when the book has a right-to-left translation. The stored page goes into the messages of the calls that follow the render (the visual review, the activity answers), and the LLM cache key hashes those messages: rewriting it would make a book that gains or loses a translation run those calls again, for a page that looks the same in its own language. Such a page is made neutral only where it is read in the translation, by the packaging rewrite above.
+
+Sectioning is told too, because it saves the order a page is read in. The two sectioning prompts include `prompts/_reading_direction.liquid`, which renders only for a right-to-left page and says that reading starts at the right: the rightmost column, block or table cell comes first. Without it a right-to-left table is saved left to right and renders mirrored, and read-aloud follows the wrong order. `sectionPage()` receives the direction as `pageDirection` from the same `resolvePageDirection()` gate.
+
 Exports are only partly covered. WebPub and PNLD reuse the packaged pages, so their content pages keep `dir`; EPUB rebuilds each page's root element (`convertPageToXhtml()`) and carries `dir` over, which a direction-neutral page depends on because it no longer sets a direction of its own. No export declares a right-to-left page progression yet (EPUB `page-progression-direction`, WebPub `readingProgression`), and the navigation documents the packagers generate themselves carry no `dir`.
 
 ---
@@ -288,7 +308,30 @@ books/
         └── ...
 ```
 
-The `.db` file uses entity versioning — `node_data` rows are never overwritten. Each `putNodeData()` call inserts a new row with `version = MAX(version) + 1`. Full rollback history is preserved.
+The `.db` file uses entity versioning: `putNodeData()` inserts a new row with `version = MAX(version) + 1`. The sole physical-recovery exception is explicitly confirmed restoration of a damaged historical tuple to proven exact bytes with an immutable damage audit; the selected repaired entity also receives a fresh version. Arbitrary historical edits remain forbidden.
+
+Additional book-local persistence used by SPEC-0003:
+
+| Record | Purpose and ownership |
+|---|---|
+| `.sectioning-lifecycle.json`, `.sectioning-transition.json` | Informational readiness and configuration publication recovery. Reset rolls back its SQLite changes on failure; lifecycle invalidation can conservatively remain stale. It is not an output-currentness proof. |
+| `.book-writer.json`, its preparing/recovery/successor artifacts, `<label>.db.lock` | Shared admission and SQLite mutex evidence. Only proven ownership authorizes cleanup; never delete locks by age. |
+| `extraction.json`, `part.json` | Extraction fingerprint/assets and mandatory part scope; existing-book CLI resume remains outside SPEC-0003. |
+| `.adt-package-work/format`, owned staging directories | Recoverable package publication workspace. Empty unmarked workspaces may be initialized under writer admission; unknown contents remain protected. |
+| `adt/.build-hash`, `.build-version`, `.build-warnings`, `.build-owners` | Cached package input, warnings and origin/ownership receipts. Content tolerance never relaxes origin proof. |
+| `.config-recovery-<sha256>.yaml` | Exact invalid prior overrides retained before an explicit valid repair; hash-checked when allowing initial extraction. |
+| `.book-recovery-pending.json`, `.book-recovery-<uuid>/` | A separate recovery copy stays hidden/refused until validated; its audit and quarantined lock evidence are retained. The original is untouched. |
+| `history_identity`, `history_slots`, `history_witnesses` | Persistent book identity, tuple incarnations/presence and compressed exact-byte witnesses/retired identity reservations. |
+| `schema_version.history_evidence_version`, `.history_evidence_gap`, `.history_legacy_capture` | Durable continuity-loss and one-time readable legacy capture markers. |
+| `history_repair_permits`, `history_recovery_audit`, `history_recovery_requests` | Transaction-scoped exact repairs, immutable damaged-byte audit and idempotent request receipts. |
+
+`book-recovery-copy.ts` handles the explicit separate-copy operation. Known-live
+owners are refused; unknown/legacy owners are never silently unlocked. Readable
+legacy history is captured once on first open; later checkpoints, repairs and
+regeneration remain explicit. Missing tracking/schema evidence is not recreated
+as proof of continuity. Project ZIP admission lasts through source reading and
+compression, not through consumer download; queued archive bytes are independent
+of later edits.
 
 ---
 
@@ -337,3 +380,53 @@ API ──── step-start ────► mark step + stage as "running"
 | HTML rendering templates | `templates/` |
 | Coding standards | `docs/GUIDELINES.md` |
 | Architecture decision records | `docs/DECISIONS.md` |
+
+### Recovery-copy operational limits
+
+Copy recovery is offered for lock admission failures, not invalid configuration or
+corrupt content. The original remains unchanged and may still be unavailable.
+Interrupted copies retain `.book-recovery-pending.json` and remain hidden/refused;
+start a new copy from the preserved original. After all ADT instances are closed,
+an operator may move an unwanted **whole** original or incomplete-copy directory
+out of `BOOKS_DIR` into a backup location using the filesystem. Do not delete lock
+files to force admission. Verify the successful copy and retain the original
+before deciding on any permanent cleanup.
+
+Same-process Library/open attempts are refused without writing source admission
+artifacts while copying. Other-process changes cause validation refusal. SQLite
+integrity validation is synchronous; it can temporarily occupy the API event
+loop on large databases. File permission bits are preserved, but the copy and
+atomic replacement files belong to the creating process, not necessarily the
+original group. These are operational limits, not OS-reboot or release certification.
+
+Without verifiable process-incarnation evidence, a same-host lease whose PID is
+currently alive remains refused. This includes current macOS/Windows leases as
+well as legacy leases. An unrelated process reusing that PID
+can therefore also prevent copy recovery. File age alone is not proof that the
+recorded owner is dead; timestamps do not override this refusal.
+The owner explicitly accepted this narrow recovery limitation on November 17,
+2026 and @gbergengruen [approved the amended contract on November 18](https://github.com/unicef/adt-studio/pull/884#pullrequestreview-5957765294).
+This does not promise recovery of every stranded book after reboot, or grant
+PR/release approval.
+
+A recovery copy is an intentional continuation of the same saved project, not a
+new authored fork. It keeps `.adt-project.json`'s `projectId`, the persistent
+history book UUID, historical entities and original export `originProjectId`.
+Its directory label is new. If a later ADT import finds that origin project ID
+already present, the existing import policy allocates a fresh project ID and
+records `derivedFromProjectId`; recovery does not bypass that policy.
+
+The quarantined `.book-recovery-<uuid>/locks/` and audit directory remain part of
+a project ZIP backup. Lock records may contain the original hostname and process
+ID. Consider that evidence when sharing the project archive; these retained
+records are evidence, not active locks on import. Recovery does not silently
+strip them or rewrite identity/history to hide them. File access, insufficient
+space and an occupied destination label have distinct recovery errors. A refused
+incomplete copy is checked before creating identity, media directories or locks.
+
+Library listings do not build cold Storyboard HTML/ownership read models. A
+current in-memory result can be reused. Otherwise, completed run telemetry or a
+saved package results in an explicitly unverified summary, withholding
+Storyboard/package/Preview completion; extracted-only books keep their next-step
+guidance. Full
+book/Preview/export validation is still required at the existing entrypoints.
