@@ -1998,6 +1998,11 @@ describe("packageAdtWeb", () => {
             ],
           },
         },
+        "image-captioning": {
+          pg003: {
+            captions: [{ imageId: "pg003_im007_audio", caption: "Mago" }],
+          },
+        },
         "core-tts-catalog": { en: readyCoreTtsCatalog("pg003_im007_audio") },
         tts: {
           en: {
